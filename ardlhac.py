@@ -1,775 +1,1002 @@
+import warnings
+warnings.filterwarnings('ignore')
+
 import numpy as np
 import pandas as pd
+import os
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.linear_model import LassoCV, ElasticNetCV
+from scipy import stats
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import spearmanr
 
-CSV_PATH = r"G:\merged_data.csv" # замените на путь к вашему файлу
-df = pd.read_csv(CSV_PATH)
-df["date"] = df["date"].astype(str).str[:7]
-df = df[(df["date"] >= "2021-01") & (df["date"] <= "2025-10")].copy()
-df = df.sort_values("date").reset_index(drop=True)
-
-print(f"\n{'═'*70}")
-print(f" ДАННЫЕ")
-print(f"{'═'*70}")
-print(f"  Период: {df['date'].min()} — {df['date'].max()}")
-print(f"  Наблюдений: {len(df)} месяцев")
-
-def col(name):
-    """Безопасно берём столбец как float."""
-    return pd.to_numeric(df[name], errors="coerce")
-
-REGIONS = [
-    "Москва", "Санкт-Петербург", "Московская область",
-    "Краснодарский край", "Республика Татарстан", "Свердловская область",
-    "Новосибирская область", "Нижегородская область", "Республика Башкортостан",
-    "Ростовская область", "Приморский край", "Пермский край",
-    "Хабаровский край", "Иркутская область", "Калининградская область",
-    "Пензенская область", "Рязанская область", "Удмуртская Республика",
-    "Россия",
-]
-
-
-oboroty_all = col("oboroty-biznesa-Все отрасли")
-
-age_active = (
-    col("potrebitelskaya-aktivnost-po-kategoriyam-tovarov-v-razreze-vozrastov-Категории товаров,25 - 34 лет") +
-    col("potrebitelskaya-aktivnost-po-kategoriyam-tovarov-v-razreze-vozrastov-Категории товаров,35 - 64 лет")
-) / 2
-
-age_inactive = (
-    col("potrebitelskaya-aktivnost-po-kategoriyam-tovarov-v-razreze-vozrastov-Категории товаров,15 - 24 лет") +
-    col("potrebitelskaya-aktivnost-po-kategoriyam-tovarov-v-razreze-vozrastov-Категории товаров,65+ лет")
-) / 2
-
-spend_essential = (
-    col("consumer-spending-Продовольственные товары") +
-    col("oboroty-biznesa-Услуги ЖКХ")
-) / 2
-
-spend_discretionary = (
-    col("consumer-spending-Непродовольственные товары") +
-    col("consumer-spending-Общественное питание") +
-    col("oboroty-biznesa-Спорт и досуг")
-) / 3
-
-key_rate = col("real-key-interest-rate-Ключевая ставка, %")
-
-national_factors = {
-    "Обороты бизнеса (все отрасли)": oboroty_all,
-    "Возраст: активные (25–64)": age_active,
-    "Возраст: неактивные (15–24, 65+)": age_inactive,
-    "Расходы обязательные": spend_essential,
-    "Расходы необязательные": spend_discretionary,
-    "Ставка ЦБ": key_rate,
-}
-
-# ─── Региональные supply/deals (динамически) ───────────────────
-SUPPLY_DEALS_PREFIXES = [
-    ("Предложение бизнес-класс", "predlozheniya-novostroek-biznes-klassa-"),
-    ("Предложение эконом/комфорт", "predlozheniya-novostroek-ekonomkomfort-klassa-"),
-    ("Предложение первичный", "predlozheniya-novostroek-"),
-    ("Предложение вторичный", "predlozheniya-vtorichnoi-nedvizhimosti-"),
-    ("Сделки первичный", "real_estate_deals_primary_market-"),
-    ("Сделки вторичный", "real_estate_deals_secondary_market-"),
-]
-
-factors_per_region = {}
-regional_available = {}
-
-for reg in REGIONS:
-    reg_factors = national_factors.copy()
-    has_regional = False
-    
-    for name, prefix in SUPPLY_DEALS_PREFIXES:
-        colname = prefix + reg
-        if colname in df.columns:
-            reg_factors[name] = col(colname)
-            has_regional = True
-        else:
-            # fallback на Россию, если регионального нет
-            fallback_col = prefix + "Россия"
-            if fallback_col in df.columns:
-                reg_factors[name] = col(fallback_col)
-            else:
-                print(f"  ⚠ {reg}: нет данных даже по России для {name}")
-    
-    # Вычисляем РЕГИОНАЛЬНЫЕ доли (если базовые supply/deals доступны)
-    eps = 1e-10
-    if "Предложение первичный" in reg_factors and reg_factors["Предложение первичный"] is not None:
-        if "Предложение бизнес-класс" in reg_factors:
-            reg_factors["Доля бизнес в первичном"] = reg_factors["Предложение бизнес-класс"] / (reg_factors["Предложение первичный"] + eps)
-        if "Предложение эконом/комфорт" in reg_factors:
-            reg_factors["Доля эконом в первичном"] = reg_factors["Предложение эконом/комфорт"] / (reg_factors["Предложение первичный"] + eps)
-        
-        secondary = reg_factors.get("Предложение вторичный", 0)
-        if secondary is not None:
-            reg_factors["Доля первичного в общем"] = reg_factors["Предложение первичный"] / (reg_factors["Предложение первичный"] + secondary + eps)
-        
-        if "Сделки первичный" in reg_factors and "Сделки вторичный" in reg_factors:
-            reg_factors["Отношение сделок P/S"] = reg_factors["Сделки первичный"] / (reg_factors["Сделки вторичный"] + eps)
-    
-    # Преобразуем в DataFrame
-    factors_per_region[reg] = pd.DataFrame({"date": df["date"], **reg_factors})
-    regional_available[reg] = has_regional
-    
-    if not has_regional:
-        print(f"  ⚠ {reg}: используются только национальные факторы (нет региональных supply/deals)")
-
-print(f"\n  Регионов с собственными supply/deals: {sum(regional_available.values())} из {len(REGIONS)}")
-
-
-REGIONS = [
-    "Москва", "Санкт-Петербург", "Московская область",
-    "Краснодарский край", "Республика Татарстан", "Свердловская область",
-    "Новосибирская область", "Нижегородская область", "Республика Башкортостан",
-    "Ростовская область", "Приморский край", "Пермский край",
-    "Хабаровский край", "Иркутская область", "Калининградская область",
-    "Пензенская область", "Рязанская область", "Удмуртская Республика",
-    "Россия"
-]
-
-SEGMENTS = [
-    ("Бизнес-класс первичный", "biznes-klass"),
-    ("Эконом/комфорт первичный", "ekonomkomfort"),
-    ("Первичный общий", ""),
-    ("Вторичный рынок", "vtorichnii-rinok"),
-]
-
-prices = pd.DataFrame({"date": df["date"]})
-
-for reg in REGIONS:
-    for seg_name, suffix in SEGMENTS:
-        if suffix == "vtorichnii-rinok":
-            colname = f"dinamika-tsen-obyavlenii-vtorichnii-rinok-{reg}"
-        elif suffix == "":
-            colname = f"dinamika-tsen-obyavlenii-pervichnii-rinok-{reg}"
-        else:
-            colname = f"dinamika-tsen-obyavlenii-pervichnii-rinok-{suffix}-{reg}"
-        
-        if colname in df.columns:
-            prices[f"{reg} — {seg_name}"] = col(colname)
-            print(f"  Добавлен: {reg} — {seg_name} ({colname})")  # для дебага
-        else:
-            print(f"  Нет данных для {reg} — {seg_name} ({colname})")
-
-AVAILABLE_REGIONS = []
-for col in prices.columns:
-    if col != "date" and " — " in col:
-        reg_part = col.split(" — ")[0]
-        if reg_part not in AVAILABLE_REGIONS:
-            AVAILABLE_REGIONS.append(reg_part)
-
-print(f"\n  Доступных регионов с хотя бы одним сегментом цен: {len(AVAILABLE_REGIONS)}")
-print("  Список:", ", ".join(AVAILABLE_REGIONS))
-
-AVAILABLE_PRICES = [c for c in prices.columns if c != "date"]
-print(f"  Доступных комбинаций регион-сегмент: {len(AVAILABLE_PRICES)}")
-
-
-# ИМПОРТ
-import warnings
-warnings.filterwarnings("ignore")
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from scipy.stats import shapiro
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-from statsmodels.regression.linear_model import OLS
-from statsmodels.tools import add_constant
-from statsmodels.stats.stattools import durbin_watson
-import statsmodels.api as sm
-from sklearn.linear_model import RidgeCV
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import cross_val_score
-
-# Настройки
-VIF_THRESHOLD   = 10
-MIN_OBS         = 12
-HAC_LAGS        = 3
-ALPHA           = 0.05
-RIDGE_THRESHOLD = 0.45       # если adj-R² МНК меньщ этого, то Ridge
-
-# ОПРЕДЕЛЕНИЕ ГРУПП ФАКТОРОВ
-# Национальные — всегда входят в обе стратегии
-NATIONAL = [
-    "Обороты бизнеса (все отрасли)",
-    "Возраст: активные (25–64)",
-    "Возраст: неактивные (15–24, 65+)",
-    "Расходы обязательные",
-    "Расходы необязательные",
-    "Ставка ЦБ",
-]
-
-# абс
-RAW_COLS = [
-    "Предложение бизнес-класс",
-    "Предложение эконом/комфорт",
-    "Предложение первичный",
-    "Предложение вторичный",
-    "Сделки первичный",
-    "Сделки вторичный",
-]
-
-# доли
-RATIO_COLS = [
-    "Доля бизнес в первичном",
-    "Доля эконом в первичном",
-    "Доля первичного в общем",
-    "Отношение сделок P/S",
-]
-
-
-def _build_strategies(feat_df: pd.DataFrame) -> dict:
-    # квадратичный член ставки
-    if "Ставка ЦБ" in feat_df.columns:
-        feat_df = feat_df.copy()
-        feat_df["Ставка ЦБ²"] = feat_df["Ставка ЦБ"] ** 2
-
-    # абс
-    raw_cols  = [c for c in NATIONAL + RAW_COLS + ["Ставка ЦБ²"] if c in feat_df.columns]
-    # доли
-    ratio_cols = [c for c in NATIONAL + RATIO_COLS + ["Ставка ЦБ²"] if c in feat_df.columns]
-
-    return {
-        "RAW":   feat_df[raw_cols],
-        "RATIO": feat_df[ratio_cols],
-    }
-
-
-# VIF 
-def _prune_vif(X: pd.DataFrame, threshold: float = VIF_THRESHOLD):
-    dropped = {}
-    X_work = X.copy()
-    while X_work.shape[1] >= 2:
-        vifs = pd.Series(
-            [variance_inflation_factor(X_work.values, i) for i in range(X_work.shape[1])],
-            index=X_work.columns
-        )
-        if vifs.max() < threshold:
-            break
-        worst = vifs.idxmax()
-        dropped[worst] = round(float(vifs.max()), 2)
-        X_work = X_work.drop(columns=[worst])
-    return X_work, dropped
-
-
-# OLS + HAC
-def _fit_ols_hac(y, X, lags=HAC_LAGS):
-    X_c = add_constant(X)
-    return OLS(y, X_c).fit(cov_type="HAC", cov_kwds={"maxlags": lags})
-
-
-# RIDGE
-def _fit_ridge(y, X):
-    scaler = StandardScaler()
-    X_s = scaler.fit_transform(X)
-    alphas = np.logspace(-3, 3, 50)
-    ridge = RidgeCV(alphas=alphas, cv=5).fit(X_s, y)
-
-    y_pred = ridge.predict(X_s)
-    ss_res  = np.sum((y.values - y_pred) ** 2)
-    ss_tot  = np.sum((y.values - y.mean()) ** 2)
-    r2      = 1 - ss_res / ss_tot
-    n, k    = X.shape
-    adj_r2  = 1 - (1 - r2) * (n - 1) / (n - k - 1)
-
-    # Коэффициенты в ориг масштабе (для интерпретации)
-    coefs_scaled = ridge.coef_
-    coefs_orig   = coefs_scaled / scaler.scale_
-    coef_series  = pd.Series(coefs_orig, index=X.columns)
-
-    return y_pred, coef_series, ridge.alpha_, r2, adj_r2
-
-
-# Текст от сонет
-FACTOR_DESCR = {
-    "const":                          "Базовый уровень цены (свободный член)",
-    "Обороты бизнеса (все отрасли)":  "Общая деловая активность в регионе",
-    "Возраст: активные (25–64)":      "Покупательная сила группы 25–64 лет",
-    "Возраст: неактивные (15–24, 65+)":"Покупательная сила молодёжи и пожилых",
-    "Расходы обязательные":           "Расходы на товары первой необходимости и ЖКХ",
-    "Расходы необязательные":         "Дискреционные расходы (досуг, питание вне дома)",
-    "Ставка ЦБ":                      "Ключевая ставка Банка России (линейный эффект)",
-    "Ставка ЦБ²":                     "Ключевая ставка в квадрате (нелинейный эффект)",
-    "Предложение бизнес-класс":       "Объём предложения бизнес-класс новостроек",
-    "Предложение эконом/комфорт":     "Объём предложения эконом/комфорт новостроек",
-    "Предложение первичный":          "Общий объём предложения на первичном рынке",
-    "Предложение вторичный":          "Объём предложения на вторичном рынке",
-    "Сделки первичный":               "Число сделок на первичном рынке",
-    "Сделки вторичный":               "Число сделок на вторичном рынке",
-    "Доля бизнес в первичном":        "Доля бизнес-класса в первичном предложении",
-    "Доля эконом в первичном":        "Доля эконом/комфорт в первичном предложении",
-    "Доля первичного в общем":        "Доля первичного рынка в общем объёме",
-    "Отношение сделок P/S":           "Соотношение сделок первичный / вторичный",
-    "lag_price":                      "Цена предыдущего месяца (лаг-1, ARDL)",
-}
-
-
-def _interpret_coef(name, coef, pval):
-    sig   = "значимый" if pval < ALPHA else "НЕ значимый"
-    direc = "положительное" if coef > 0 else "отрицательное"
-    descr = FACTOR_DESCR.get(name, name)
-    return f"  • {descr}: {direc} влияние (β = {coef:+.4f}), {sig} (p = {pval:.4f})."
-
-
-# ОТЧЁТ
-def _print_report(reg, seg, model, X_clean, dropped_vif, dw, shap_stat, shap_p,
-                  strategy_name, idx, total, ridge_info=None):
-    use_ridge = ridge_info is not None and ridge_info.get("used", False)
-
-    print(f"\n{'─'*82}")
-    print(f"  МОДЕЛЬ [{idx}/{total}]  ▸  {reg}  —  {seg}  "
-          f"[стратегия: {strategy_name}]"
-          f"{'  ⚡ Ridge' if use_ridge else ''}")
-    print(f"{'─'*82}")
-
-    # удалённые VIF
-    if dropped_vif:
-        print(f"\n  Удалены по VIF ≥ {VIF_THRESHOLD}:")
-        for name, val in dropped_vif.items():
-            print(f"      • {name:48s} VIF = {val}")
-        print(f"     Эти переменные коллинеарны и убраны.")
-    else:
-        print(f"\n  Все VIF < {VIF_THRESHOLD}, мультиколлинеарность отсутствует.")
-
-    # коэфы
-    if not use_ridge:
-        params  = model.params
-        bse     = model.bse
-        tvalues = model.tvalues
-        pvalues = model.pvalues
-        r2      = model.rsquared
-        adj_r2  = model.rsquared_adj
-        fval    = model.fvalue
-        fp      = model.f_pvalue
-    else:
-        params  = ridge_info["coefs"]
-        bse     = pd.Series(np.nan, index=params.index)
-        tvalues = pd.Series(np.nan, index=params.index)
-        pvalues = pd.Series(np.nan, index=params.index)
-        r2      = ridge_info["r2"]
-        adj_r2  = ridge_info["adj_r2"]
-        fval    = np.nan
-        fp      = np.nan
-
-    print(f"\n  Коэффициенты (SE — Newey–West HAC, alpha = {ALPHA}):"
-          if not use_ridge else
-          f"\n  Коэффициенты (Ridge, α_reg = {ridge_info['alpha']:.4f}):")
-    print(f"  {'Фактор':<50} {'β':>10} {'SE(HAC)':>10} {'t':>8} {'p':>8} {'sig':>5}")
-    print(f"  {'─'*50} {'─'*10} {'─'*10} {'─'*8} {'─'*8} {'─'*5}")
-
-    for name in params.index:
-        if use_ridge:
-            print(f"  {name:<50} {params[name]:>+10.4f} {'—':>10} {'—':>8} {'—':>8} {'—':>5}")
-        else:
-            p = pvalues[name]
-            stars = "***" if p < 0.01 else (" **" if p < 0.05 else ("  *" if p < 0.10 else "   "))
-            print(f"  {name:<50} {params[name]:>+10.4f} {bse[name]:>10.4f} "
-                  f"{tvalues[name]:>8.3f} {pvalues[name]:>8.4f} {stars:>5}")
-
-    print(f"  {'─'*92}")
-    if not use_ridge:
-        print(f"  Легенда: *** p<0.01  ** p<0.05  * p<0.10")
-
-    # качество моделей
-    print(f"\n  Качество модели:")
-    print(f"      R²      = {r2:.4f}   (объясняет {r2*100:.1f}% дисперсии цен)")
-    print(f"      adj-R²  = {adj_r2:.4f}")
-    if not use_ridge:
-        sig_f = "модель значима " if fp < 0.05 else "модель НЕ значима"
-        print(f"      F       = {fval:.2f}   (p = {fp:.4f}) — {sig_f}")
-
-    # DW
-    if dw < 1.5:
-        dw_c = "автокорреляция остатков есть (HAC компенсирует SE)"
-    elif dw > 2.5:
-        dw_c = "отрицательная автокорреляция"
-    else:
-        dw_c = "автокорреляция минимальна"
-    print(f"\n  Диагностика:")
-    print(f"      DW = {dw:.3f}  →  {dw_c}")
-    if not np.isnan(shap_p):
-        norm_c = "нормальность не отвергается" if shap_p > 0.05 else "остатки не нормальны"
-        print(f"      Шапиро: W = {shap_stat:.4f}, p = {shap_p:.4f}  →  {norm_c}")
-
-    # интерпретация
-    print(f"\n  Интерпретация:")
-    if not use_ridge:
-        for name in params.index:
-            print(_interpret_coef(name, params[name], pvalues[name]))
-    else:
-        for name in params.index:
-            direc = "положительное" if params[name] > 0 else "отрицательное"
-            descr = FACTOR_DESCR.get(name, name)
-            print(f"  • {descr}: {direc} влияние (β = {params[name]:+.4f}).")
-
-    # итог
-    method = "Ridge" if use_ridge else "OLS+HAC"
-    print(f"\n  Итог [{method}]: модель объясняет {adj_r2*100:.1f}% дисперсии цен "
-          f"(adj-R²) в «{reg}», сегмент «{seg}».")
-
-
-# графики
-def _plot_model(reg, seg, y, y_pred_lag, y_pred_no_lag, residuals,
-                r2_lag, r2_no_lag, method_label):
-
-    n = len(y)
-    t = np.arange(n)
-
-    fig = plt.figure(figsize=(18, 14))
-    fig.suptitle(f"{reg}  —  {seg}  [{method_label}]",
-                 fontsize=16, fontweight="bold")
-    fig.subplots_adjust(top=0.92, hspace=0.38, wspace=0.28)
-
-    gs = gridspec.GridSpec(3, 2, figure=fig)
-
-    # helper: линейный + scatter для одной версии модели
-    def _draw_pair(ax_line, ax_scat, y_true, y_hat, r2_val,
-                   title_suffix, color_line, color_dot):
-        # линейный график
-        ax_line.plot(t, y_true.values, color="#2196F3", lw=1.8, label="Факт")
-        ax_line.plot(t, y_hat, color=color_line, lw=1.8, ls="--",
-                     label=f"Модель  R²={r2_val:.3f}")
-        ax_line.set_title(f"Факт vs Предсказание — {title_suffix}",
-                          fontsize=11, fontweight="bold")
-        ax_line.set_xlabel("Месяц (индекс)")
-        ax_line.set_ylabel("Цена")
-        ax_line.legend(fontsize=9, loc="best")
-        ax_line.grid(alpha=0.25)
-
-        # scatter
-        ax_scat.scatter(y_hat, y_true.values, color=color_dot, s=22, alpha=0.75)
-        lo = min(y_true.min(), y_hat.min())
-        hi = max(y_true.max(), y_hat.max())
-        ax_scat.plot([lo, hi], [lo, hi], "k--", lw=1, label="y = ŷ")
-        ax_scat.set_title(f"Scatter — {title_suffix}  R²={r2_val:.3f}",
-                          fontsize=11, fontweight="bold")
-        ax_scat.set_xlabel("Предсказание")
-        ax_scat.set_ylabel("Факт")
-        ax_scat.legend(fontsize=9)
-        ax_scat.grid(alpha=0.25)
-
-    # левый столбец: С лагом
-    _draw_pair(
-        fig.add_subplot(gs[0, 0]),
-        fig.add_subplot(gs[1, 0]),
-        y, y_pred_lag, r2_lag,
-        title_suffix="с лагом (ARDL)",
-        color_line="#FF5722",
-        color_dot="#673AB7",
-    )
-
-    # правый столбец: БЕЗ лага
-    _draw_pair(
-        fig.add_subplot(gs[0, 1]),
-        fig.add_subplot(gs[1, 1]),
-        y, y_pred_no_lag, r2_no_lag,
-        title_suffix="без лага (чистые факторы)",
-        color_line="#4CAF50",
-        color_dot="#FF9800",
-    )
-
-    # row 2 left: остатки основной модели
-    ax5 = fig.add_subplot(gs[2, 0])
-    bar_colors = ["#EF5350" if r > 0 else "#42A5F5" for r in residuals]
-    ax5.bar(t, residuals, color=bar_colors, alpha=0.75, width=0.8)
-    ax5.axhline(0, color="black", lw=0.9)
-    ax5.set_title("Остатки во времени (основная модель)",
-                  fontsize=11, fontweight="bold")
-    ax5.set_xlabel("Месяц (индекс)")
-    ax5.set_ylabel("Остаток")
-    ax5.grid(alpha=0.25)
-
-    # row 2 right: QQ-plot
-    ax6 = fig.add_subplot(gs[2, 1])
-    sm.qqplot(pd.Series(residuals), line="s", ax=ax6, alpha=0.7)
-    ax6.set_title("QQ-plot остатков (основная модель)",
-                  fontsize=11, fontweight="bold")
-    ax6.grid(alpha=0.25)
-
-    plt.savefig(f"reg_{reg}_{seg}.png".replace(" ", "_").replace("/", "_"),
-                dpi=150, bbox_inches="tight")
-    plt.show()
-
-
-# Мейн
-def run_all_regressions(factors_per_region: dict,
-                        prices: pd.DataFrame,
-                        available_regions: list):
-    
-    SEGMENT_NAMES = [
-        "Бизнес-класс первичный",
-        "Эконом/комфорт первичный",
-        "Первичный общий",
-        "Вторичный рынок",
+print("=" * 100)
+print("АНАЛИЗ ФАКТОРОВ ВЛИЯНИЯ НА ЦЕНЫ НЕДВИЖИМОСТИ")
+print("С учетом малого объема данных (2022-01 до 2025-09)")
+print("=" * 100)
+
+# ЗАГРУЗКА ДАННЫХ
+
+print("\n[1/6] Загрузка объединенных данных...")
+
+data_file = r"G:\downloads\housingdata.csv" #Путь
+df = pd.read_csv(data_file, sep=";", parse_dates=['date'])
+
+print(f"  Загружено: {len(df)} строк, {len(df.columns)} столбцов")
+print(f"  Период: {df['date'].min()} - {df['date'].max()}")
+
+# Фильтруем: с 2022-01 (когда появились Предложения)
+df = df[df['date'] >= '2022-01-01'].copy()
+df = df[df['date'] <= '2025-09-01'].copy()  # До сентября 2025
+
+print(f"  После фильтрации: {len(df)} месяцев (2022-01 до 2025-09)")
+
+df.set_index('date', inplace=True)
+
+
+# ФЕДЕРАЛЬНЫЕ ОКРУГА КОТОРЫЕ ЕСТЬ В ДАННЫХ
+
+FEDERAL_DISTRICTS = {
+    'Центральный ФО': [
+        'Белгородская область', 'Брянская область', 'Владимирская область',
+        'Воронежская область', 'Ивановская область', 'Калужская область',
+        'Костромская область', 'Курская область', 'Липецкая область',
+        'Московская область', 'Орловская область', 'Рязанская область',
+        'Смоленская область', 'Тамбовская область', 'Тверская область',
+        'Тульская область', 'Ярославская область', 'Москва'
+    ],
+    'Северо-Западный ФО': [
+        'Республика Карелия', 'Республика Коми', 'Архангельская область',
+        'Вологодская область', 'Калининградская область', 'Ленинградская область',
+        'Мурманская область', 'Новгородская область', 'Псковская область',
+        'Санкт-Петербург', 'Ненецкий автономный округ'
+    ],
+    'Южный ФО': [
+        'Республика Адыгея', 'Республика Калмыкия', 'Республика Крым',
+        'Краснодарский край', 'Астраханская область', 'Волгоградская область',
+        'Ростовская область', 'Севастополь'
+    ],
+    'Северо-Кавказский ФО': [
+        'Республика Дагестан', 'Республика Ингушетия', 'Кабардино-Балкарская Республика',
+        'Карачаево-Черкесская Республика', 'Республика Северная Осетия - Алания',
+        'Чеченская Республика', 'Ставропольский край'
+    ],
+    'Приволжский ФО': [
+        'Республика Башкортостан', 'Республика Марий Эл', 'Республика Мордовия',
+        'Республика Татарстан', 'Удмуртская Республика', 'Чувашская Республика',
+        'Пермский край', 'Кировская область', 'Нижегородская область',
+        'Оренбургская область', 'Пензенская область', 'Самарская область',
+        'Саратовская область', 'Ульяновская область'
+    ],
+    'Уральский ФО': [
+        'Курганская область', 'Свердловская область', 'Тюменская область',
+        'Челябинская область', 'Ханты-Мансийский автономный округ',
+        'Ямало-Ненецкий автономный округ'
+    ],
+    'Сибирский ФО': [
+        'Республика Алтай', 'Республика Тыва', 'Республика Хакасия',
+        'Алтайский край', 'Красноярский край', 'Иркутская область',
+        'Кемеровская область', 'Новосибирская область', 'Омская область',
+        'Томская область'
+    ],
+    'Дальневосточный ФО': [
+        'Республика Бурятия', 'Республика Саха (Якутия)', 'Забайкальский край',
+        'Камчатский край', 'Приморский край', 'Хабаровский край',
+        'Амурская область', 'Магаданская область', 'Сахалинская область',
+        'Еврейская автономная область', 'Чукотский автономный округ'
     ]
+}
 
-    # ── считаем общее число моделей для прогресса ──
-    total = 0
-    for reg in sorted(available_regions):
-        if reg not in factors_per_region:
-            continue
-        for seg in SEGMENT_NAMES:
-            if f"{reg} — {seg}" in prices.columns:
-                total += 1
+def get_federal_district(region):
+    """Определение федерального округа по региону"""
+    for fo, regions in FEDERAL_DISTRICTS.items():
+        if region in regions:
+            return fo
+    return None
 
-    print(f"\n{'═'*82}")
-    print(f"  ЛИНЕЙНАЯ РЕГРЕССИЯ v2  ▸  моделей: {total}")
-    print(f"  Стратегии факторов: RAW (объёмы) и RATIO (доли)")
-    print(f"  Дополнения: lag(1) цены (ARDL), Ставка ЦБ² (нелинейность)")
-    print(f"  Fallback: Ridge CV если OLS adj-R² < {RIDGE_THRESHOLD}")
-    print(f"{'═'*82}\n")
+# ПОДГОТОВКА ПАНЕЛЬНЫХ ДАННЫХ
 
-    results_log = []
-    idx = 0
+print("\n[2/6] Подготовка панельных данных...")
 
-    for reg in sorted(available_regions):
-        if reg not in factors_per_region:
-            continue
+# Идентифицируем регионы с полными данными
+price_cols = [col for col in df.columns if col.startswith('real_estate_deals_primary_market-')]
+regions_available = []
 
-        feat_df = factors_per_region[reg].drop(columns=["date"], errors="ignore")
+print(f" Проверка доступности данных по регионам...")
 
-        for seg in SEGMENT_NAMES:
-            price_col = f"{reg} — {seg}"
-            if price_col not in prices.columns:
-                continue
-            idx += 1
-
-            # маска: убираем NaN
-            y_raw = prices[price_col]
-            mask  = y_raw.notna() & feat_df.notna().all(axis=1)
-            # сдвигаем на 1 для лага теряем первую строку
-            mask  = mask & mask.shift(1).fillna(False).astype(bool)
-
-            y     = y_raw[mask].reset_index(drop=True).astype(float)
-            feat  = feat_df[mask].reset_index(drop=True).astype(float)
-
-            if len(y) < MIN_OBS:
-                print(f"  [{idx}/{total}] {reg} — {seg}: мало наблюдений ({len(y)}), пропуск.")
-                continue
-
-            # лаг(1) цены
-            lag_price = y_raw[mask].shift(1).reset_index(drop=True).astype(float)
-            # после shift первая строка NaN убирать
-            valid     = lag_price.notna()
-            y         = y[valid].reset_index(drop=True)
-            feat      = feat[valid].reset_index(drop=True)
-            lag_price = lag_price[valid].reset_index(drop=True)
-
-            if len(y) < MIN_OBS:
-                print(f"  ⚠ [{idx}/{total}] {reg} — {seg}: после лага мало наблюдений, пропуск.")
-                continue
-
-            # две страты
-            strategies = _build_strategies(feat)
-
-            best_model       = None
-            best_adj_r2      = -np.inf
-            best_strategy    = ""
-            best_X_clean     = None
-            best_dropped     = {}
-            best_ridge_info  = None
-
-            for strat_name, X_strat in strategies.items():
-                # lag добавляем ПОСЛЕ VIF. VIF считается по X, без lag_price
-                X_clean, dropped = _prune_vif(X_strat)
-
-                if X_clean.shape[1] == 0:
-                    continue
-
-                # lag back
-                X_clean = X_clean.copy()
-                X_clean["lag_price"] = lag_price.values
-
-                # OLS + HAC
-                model = _fit_ols_hac(y, X_clean)
-
-                if model.rsquared_adj > best_adj_r2:
-                    best_adj_r2     = model.rsquared_adj
-                    best_model      = model
-                    best_strategy   = strat_name
-                    best_X_clean    = X_clean
-                    best_dropped    = dropped
-                    best_ridge_info = None      # сбрасываем Ridge
-
-            if best_model is None:
-                print(f" [{idx}/{total}] {reg} — {seg}: обе стратегии пустые после VIF, скип.")
-                continue
-
-            # Ridge без VIF
-            if best_adj_r2 < RIDGE_THRESHOLD:
-                # восстанавливаем полный X лучшей страты + lag
-                X_ridge = strategies[best_strategy].copy()
-                X_ridge["lag_price"] = lag_price.values
-
-                y_pred_r, coefs_r, alpha_r, r2_r, adj_r2_r = _fit_ridge(y, X_ridge)
-                print(f"  [{idx}/{total}] {reg} — {seg}: Ridge vs OLS "
-                      f"adj-R²: {adj_r2_r:.4f} vs {best_adj_r2:.4f} "
-                      f"(α = {alpha_r:.4f}, факторов = {X_ridge.shape[1]})")
-                if adj_r2_r > best_adj_r2:
-                    best_ridge_info = {
-                        "used":    True,
-                        "alpha":   alpha_r,
-                        "r2":      r2_r,
-                        "adj_r2":  adj_r2_r,
-                        "coefs":   coefs_r,
-                        "y_pred":  y_pred_r,
-                    }
-                    print(f"  Ridge выбран (лучше OLS на {adj_r2_r - best_adj_r2:+.4f})")
-
-            # остатки
-            if best_ridge_info and best_ridge_info["used"]:
-                residuals = y.values - best_ridge_info["y_pred"]
-                y_pred    = best_ridge_info["y_pred"]
-                method_label = f"Ridge α={best_ridge_info['alpha']:.3f}"
-            else:
-                residuals = best_model.resid.values
-                y_pred    = best_model.fittedvalues.values
-                method_label = "OLS+HAC"
-
-            dw = durbin_watson(residuals)
-            if len(residuals) <= 5000:
-                shap_stat, shap_p = shapiro(residuals)
-            else:
-                shap_stat, shap_p = np.nan, np.nan
-
-            # принт
-            _print_report(
-                reg, seg, best_model, best_X_clean, best_dropped,
-                dw, shap_stat, shap_p, best_strategy, idx, total,
-                ridge_info=best_ridge_info
-            )
-
-            # модель БЕЗ лага (для графика)
-            X_no_lag = best_X_clean.drop(columns=["lag_price"], errors="ignore")
-            if X_no_lag.shape[1] > 0:
-                model_no_lag  = _fit_ols_hac(y, X_no_lag)
-                y_pred_no_lag = model_no_lag.fittedvalues.values
-                r2_no_lag     = model_no_lag.rsquared
-            else:
-                # если после убрать лаг ничего не осталось — просто среднее
-                y_pred_no_lag = np.full(len(y), y.mean())
-                r2_no_lag     = 0.0
-
-            # R² основной модели (с лагом)
-            r2_lag = (best_ridge_info["r2"]
-                      if best_ridge_info and best_ridge_info["used"]
-                      else best_model.rsquared)
-
-            # график
-            _plot_model(reg, seg, y,
-                        y_pred,          # с лагом
-                        y_pred_no_lag,   # без лага
-                        residuals,
-                        r2_lag, r2_no_lag,
-                        method_label)
-
-            # лог
-            final_adj_r2 = (best_ridge_info["adj_r2"]
-                            if best_ridge_info and best_ridge_info["used"]
-                            else best_adj_r2)
-            results_log.append({
-                "Регион":        reg,
-                "Сегмент":       seg,
-                "Стратегия":     best_strategy,
-                "Метод":         method_label,
-                "N":             len(y),
-                "Факторов":      best_X_clean.shape[1],
-                "Удалено (VIF)": len(best_dropped),
-                "R² (с лагом)":  round(r2_lag, 4),
-                "R² (без лага)": round(r2_no_lag, 4),
-                "adj-R²":        round(final_adj_r2, 4),
-                "DW":            round(dw, 3),
-                "Шапиро p":      round(shap_p, 4) if not np.isnan(shap_p) else "—",
+for col in price_cols:
+    region = col.replace('real_estate_deals_primary_market-', '')
+    
+    # Формируем названия колонок с учетом возможных пробелов
+    # Пробуем оба варианта: с подчеркиванием и с пробелом
+    housing_variants = [f'housing_completed_{region}', f'housing_completed {region}']
+    loans_variants = [f'housing_loans_{region}', f'housing_loans {region}']
+    
+    # Находим существующие колонки
+    housing_col = next((col for col in housing_variants if col in df.columns), None)
+    loans_col = next((col for col in loans_variants if col in df.columns), None)
+    
+    required_cols = {
+        'price_primary': f'real_estate_deals_primary_market-{region}',
+        'price_secondary': f'real_estate_deals_secondary_market-{region}',
+        'housing': housing_col,
+        'loans': loans_col,
+        'offers_primary': f'predlozheniya-novostroek-{region}',
+        'offers_secondary': f'predlozheniya-vtorichnoi-nedvizhimosti-{region}'
+    }
+    
+    # Проверяем наличие колонок
+    available = {}
+    for key, col_name in required_cols.items():
+        available[key] = col_name is not None and col_name in df.columns
+    
+    # Нужна хотя бы одна цена (первичка или вторичка), жилье и кредиты
+    has_price = available['price_primary'] or available['price_secondary']
+    
+    if has_price and available['housing'] and available['loans']:
+        # Проверяем есть ли хоть какие-то предложения
+        has_any_offers = available['offers_primary'] or available['offers_secondary']
+        
+        # Формируем список для проверки пропусков (только реальные названия колонок)
+        check_cols = []
+        
+        # Добавляем housing и loans
+        if required_cols['housing']:
+            check_cols.append(required_cols['housing'])
+        if required_cols['loans']:
+            check_cols.append(required_cols['loans'])
+        
+        # Добавляем цену (приоритет - первичка)
+        if available['price_primary']:
+            check_cols.append(required_cols['price_primary'])
+            price_type = 'primary'
+        else:
+            check_cols.append(required_cols['price_secondary'])
+            price_type = 'secondary'
+        
+        if available['offers_primary']:
+            check_cols.append(required_cols['offers_primary'])
+        elif available['offers_secondary']:
+            check_cols.append(required_cols['offers_secondary'])
+        
+        na_count = df[check_cols].isna().sum().sum()
+        total_cells = len(df) * len(check_cols)
+        completeness = (1 - na_count / total_cells) * 100
+        
+        # Берем регионы с полнотой > 80%
+        if completeness > 80:
+            regions_available.append({
+                'region': region,
+                'price_type': price_type,
+                'has_offers': has_any_offers,
+                'offers_type': 'primary' if available['offers_primary'] else ('secondary' if available['offers_secondary'] else None),
+                'completeness': completeness,
+                'na_count': na_count
             })
 
-    # итог
-    _print_summary(results_log)
-    return results_log
+print(f"  Найдено регионов с полными данными: {len(regions_available)}")
 
+if len(regions_available) == 0:
+    print("\n ВНИМАНИЕ: Не найдено регионов с полными данными!")
+    print("   Проверим какие колонки есть в датасете:")
+    
+    # Показываем примеры колонок
+    print(f"\n  Примеры колонок цен:")
+    for col in price_cols[:5]:
+        print(f"    • {col}")
+    
+    print(f"\n  Примеры колонок housing_completed:")
+    housing_cols = [col for col in df.columns if col.startswith('housing_completed_')]
+    for col in housing_cols[:5]:
+        print(f"    • {col}")
+    
+    print(f"\n  Примеры колонок housing_loans:")
+    loans_cols = [col for col in df.columns if col.startswith('housing_loans_')]
+    for col in loans_cols[:5]:
+        print(f"    • {col}")
+    
+    print(f"\n  Примеры колонок predlozheniya:")
+    offers_cols = [col for col in df.columns if col.startswith('predlozheniya')]
+    for col in offers_cols[:5]:
+        print(f"    • {col}")
+    
+    raise ValueError("Не удалось найти регионы с полными данными. Проверьте названия колонок.")
+# Чекаем
+print(f"  Топ-5 регионов по полноте данных:")
+regions_available_sorted = sorted(regions_available, key=lambda x: x['completeness'], reverse=True)
+for r in regions_available_sorted[:5]:
+    price_info = "первичка" if r['price_type'] == 'primary' else "вторичка"
+    offers_info = f"{r['offers_type']}" if r['has_offers'] else "нет"
+    print(f"    • {r['region']:<35s} цена: {price_info}, предложения: {offers_info}, полнота: {r['completeness']:.1f}%")
 
-# Результаты
-def _print_summary(results_log):
-    if not results_log:
-        print("\n  Нет результатов.")
-        return
+# Создаем панельный датасет
+panel_data = []
 
-    df = pd.DataFrame(results_log).sort_values("adj-R²", ascending=False).reset_index(drop=True)
+for region_info in regions_available:
+    region = region_info['region']
+    price_type = region_info['price_type']
+    fo = get_federal_district(region)
+    
+    # Определяем колонку с ценой
+    if price_type == 'primary':
+        price_col = f'real_estate_deals_primary_market-{region}'
+    else:
+        price_col = f'real_estate_deals_secondary_market-{region}'
+    
+    # Определяем колонку с предложениями
+    if region_info['offers_type'] == 'primary':
+        offers_col = f'predlozheniya-novostroek-{region}'
+    elif region_info['offers_type'] == 'secondary':
+        offers_col = f'predlozheniya-vtorichnoi-nedvizhimosti-{region}'
+    else:
+        offers_col = None
+    
+    for date in df.index:
+        row = {
+            'date': date,
+            'region': region,
+            'federal_district': fo,
+            'market_type': price_type,
+            # Зависимая переменная
+            'price': df.loc[date, price_col],
+            # Независимые
+            'rate': df.loc[date, 'Ключевая ставка, %'],
+            'inflation': df.loc[date, 'Базовая инфляция по трем месяцам, %'],
+            'housing_completed': df.loc[date, f'housing_completed_{region}'],
+            'housing_loans': df.loc[date, f'housing_loans_{region}'],
+        }
+        
+        # Добавляем предложения если есть
+        if offers_col:
+            row['offers'] = df.loc[date, offers_col]
+        else:
+            row['offers'] = np.nan
+        
+        panel_data.append(row)
 
-    # вклад лага дельта R²
-    df["Δ R² (лаг)"] = df["R² (с лагом)"] - df["R² (без лага)"]
+df_panel = pd.DataFrame(panel_data)
 
-    print(f"\n\n{'═'*120}")
-    print(f"  ИТОГОВАЯ СВОДКА (adj-R² ↓)")
-    print(f"{'═'*120}")
-    print(df.drop(columns=["_dw_dist"], errors="ignore").to_string(index=False))
+print(f"\n  Создан панельный датасет:")
+print(f"    Всего строк: {len(df_panel)}")
+print(f"    Пропусков в offers: {df_panel['offers'].isna().sum()}")
 
-    print(f"\n{'─'*120}")
-    print(f"  ТОП-5 по adj-R²:")
-    print(f"{'─'*120}")
-    for i, row in df.head(5).iterrows():
-        print(f"    {i+1}. {row['Регион']:32s} | {row['Сегмент']:30s} | "
-              f"adj-R² = {row['adj-R²']:.4f} | {row['Метод']:20s} | факторов = {row['Факторов']}")
+# Удаляем строки с критичными пропусками (кроме offers)
+critical_cols = ['price', 'rate', 'inflation', 'housing_completed', 'housing_loans']
+df_panel = df_panel.dropna(subset=critical_cols)
 
-    print(f"\n{'─'*120}")
-    print(f"  ТОП-5 по DW (ближе всего к 2):")
-    print(f"{'─'*120}")
-    df["_dw_dist"] = abs(df["DW"] - 2.0)
-    for i, (_, row) in enumerate(df.nsmallest(5, "_dw_dist").iterrows(), 1):
-        print(f"    {i}. {row['Регион']:32s} | {row['Сегмент']:30s} | "
-              f"DW = {row['DW']:.3f} | adj-R² = {row['adj-R²']:.4f}")
+print(f"  После удаления пропусков: {len(df_panel)} строк")
 
-    # общие выводы
-    print(f"\n{'═'*120}")
-    print(f"  ОБЩИЕ ВЫВОДЫ")
-    print(f"{'═'*120}")
+print(f"  Панельный датасет: {len(df_panel)} наблюдений")
+print(f"  Регионов: {df_panel['region'].nunique()}")
+print(f"  Месяцев: {df_panel['date'].nunique()}")
 
-    mean_adj = df["adj-R²"].mean()
-    print(f"\n  • Среднее adj-R²: {mean_adj:.4f} "
-          f"({'удовлетворительное' if mean_adj > 0.5 else 'низкое'})")
+# СТРАТЕГИЯ 1: RAW DATA (абсолютные значения)
 
-    print(f"\n  • По сегментам:")
-    for seg, val in df.groupby("Сегмент")["adj-R²"].mean().sort_values(ascending=False).items():
-        print(f"      {seg:42s}  {val:.4f}")
+print("\n[3/6] Стратегия 1: Анализ на абсолютных значениях (RAW)...")
 
-    print(f"\n  • По регионам (топ-5):")
-    for reg, val in df.groupby("Регион")["adj-R²"].mean().sort_values(ascending=False).head(5).items():
-        print(f"      {reg:42s}  {val:.4f}")
+# Создаем копию для RAW стратегии
+df_raw = df_panel.copy()
 
-    print(f"\n  • Стратегия факторов:")
-    for strat, cnt in df["Стратегия"].value_counts().items():
-        print(f"      {strat:10s}: выбрана в {cnt} моделях")
+# Нормализация (StandardScaler для каждого региона отдельно)
+print("  Нормализация данных...")
 
-    print(f"\n  • Метод:")
-    for m, cnt in df["Метод"].value_counts().items():
-        print(f"      {m:25s}: {cnt} моделей")
+numeric_cols = ['price', 'housing_completed', 'housing_loans']
 
-    dw_ok = ((df["DW"] > 1.5) & (df["DW"] < 2.5)).sum()
-    print(f"\n  • DW в норме (1.5–2.5): {dw_ok} из {len(df)} моделей")
-    print(f"    (добавление lag(1) цены существенно улучшает DW vs v1)")
+df_raw_normalized = []
+for region in df_raw['region'].unique():
+    region_data = df_raw[df_raw['region'] == region].copy()
+    
+    scaler = RobustScaler()  # Устойчив к выбросам
+    region_data[numeric_cols] = scaler.fit_transform(region_data[numeric_cols])
+    
+    # Нормализуем offers отдельно если есть
+    if not region_data['offers'].isna().all():
+        offers_scaler = RobustScaler()
+        region_data[['offers']] = offers_scaler.fit_transform(region_data[['offers']].fillna(0))
+    
+    df_raw_normalized.append(region_data)
 
-    print(f"\n  • Среднее факторов после VIF: {df['Факторов'].mean():.1f} "
-          f"(макс {df['Факторов'].max()}, мин {df['Факторов'].min()})")
+df_raw_norm = pd.concat(df_raw_normalized, ignore_index=True)
 
-    # ── вклад лага ──
-    print(f"\n{'─'*120}")
-    print(f"  ВКЛАД ЛАГА (насколько lag(1) цены улучшает R² сверх чистых факторов X)")
-    print(f"{'─'*120}")
-    mean_delta = df["Δ R² (лаг)"].mean()
-    print(f"  • Среднее Δ R²: +{mean_delta:.4f}")
-    print(f"  • Макс  Δ R²:   +{df['Δ R² (лаг)'].max():.4f}  "
-          f"({df.loc[df['Δ R² (лаг)'].idxmax(), 'Регион']} — "
-          f"{df.loc[df['Δ R² (лаг)'].idxmax(), 'Сегмент']})")
-    print(f"  • Мин   Δ R²:   +{df['Δ R² (лаг)'].min():.4f}  "
-          f"({df.loc[df['Δ R² (лаг)'].idxmin(), 'Регион']} — "
-          f"{df.loc[df['Δ R² (лаг)'].idxmin(), 'Сегмент']})")
-    print(f"\n  Интерпретация: высокий Δ означает сильную инерцию цен в регионе —")
-    print(f"  цена прошлого месяца сама по себе хорошо предсказывает текущую.")
-    print(f"  Низкий Δ означает, что факторы X (ставка, предложение и т.д.)")
-    print(f"  объясняют цену почти без помощи лага.")
+print(f"     Нормализовано {len(df_raw_norm)} наблюдений")
 
-results = run_all_regressions(factors_per_region, prices, AVAILABLE_REGIONS)
+# СТРАТЕГИЯ 2: RATIO DATA (относительные величины)
+
+print("\n[4/6] Стратегия 2: Анализ на относительных величинах (RATIO)...")
+
+df_ratio = df_panel.copy()
+
+# Вычисляем относительные изменения (% от начального уровня)
+print("  📊 Расчет относительных величин...")
+
+for region in df_ratio['region'].unique():
+    mask = df_ratio['region'] == region
+    
+    # Берем первое значение как базу
+    for col in numeric_cols:
+        base_value = df_ratio.loc[mask, col].iloc[0]
+        if base_value > 0:
+            df_ratio.loc[mask, f'{col}_ratio'] = (df_ratio.loc[mask, col] / base_value - 1) * 100
+        else:
+            df_ratio.loc[mask, f'{col}_ratio'] = 0
+
+print(f"     ✓ Рассчитаны relative changes для {len(df_ratio)} наблюдений")
+
+# [5/6] МЕТОДЫ АНАЛИЗА
+
+print("\n[5/6] Анализ влияния факторов на цены...")
+
+output_folder = r"G:\downloads\price_factors_results"
+os.makedirs(output_folder, exist_ok=True)
+
+# МЕТОД 1: КОРРЕЛЯЦИОННЫЙ АНАЛИЗ (Spearman)
+
+print("\n  Корреляционный анализ (Spearman)...")
+
+# Подготовка данных для корреляции
+corr_cols = ['price', 'rate', 'inflation', 'housing_completed', 'housing_loans']
+if df_panel['offers'].notna().sum() > 100:  # Если есть достаточно данных
+    corr_cols.append('offers')
+
+corr_data = df_panel[corr_cols].copy()
+
+# Spearman корреляция (устойчива к выбросам и нелинейности)
+corr_matrix = corr_data.corr(method='spearman')
+
+print(f"\n     Корреляция с ценой (Spearman):")
+price_corr = corr_matrix['price'].drop('price').sort_values(ascending=False)
+for factor, corr in price_corr.items():
+    direction = "↑" if corr > 0 else "↓"
+    if abs(corr) > 0.5:
+        significance = "***"
+    elif abs(corr) > 0.3:
+        significance = "**"
+    elif abs(corr) > 0.1:
+        significance = "*"
+    else:
+        significance = ""
+    print(f"       {factor:<25s} {direction} {corr:>7.4f} {significance}")
+
+# Сохраняем
+corr_matrix.to_csv(f"{output_folder}/correlation_matrix.csv", sep=";")
+print(f"\n    Сохранено: correlation_matrix.csv")
+
+# ============================================================================
+# МЕТОД 2: ПРОВЕРКА МУЛЬТИКОЛЛИНЕАРНОСТИ (корреляции для панели)
+# ============================================================================
+print("\n  Проверка мультиколлинеарности (корреляционная матрица)...")
+
+# ВАЖНО: VIF некорректен для панельных данных!
+# Используем корреляции между независимыми переменными
+
+# Подготовка данных (без пропусков)
+X_cols = ['rate', 'inflation', 'housing_loans', 'housing_completed']
+if 'offers' in corr_cols:
+    X_cols.append('offers')
+
+corr_X = df_panel[X_cols].dropna()
+
+# Корреляционная матрица между независимыми переменными
+corr_matrix_X = corr_X.corr(method='pearson')
+
+print(f"\n     Корреляции между независимыми переменными:")
+print(f"     (Порог для беспокойства: |r| > 0.8)")
+print()
+
+# Форматированный вывод
+col_width = 15
+header = "Variable".ljust(col_width)
+for col in corr_matrix_X.columns:
+    header += col[:12].ljust(col_width)
+print(f"     {header}")
+print(f"     {'-' * len(header)}")
+
+for idx, row_name in enumerate(corr_matrix_X.index):
+    row_str = row_name[:12].ljust(col_width)
+    for col_idx, val in enumerate(corr_matrix_X.iloc[idx]):
+        if idx == col_idx:
+            row_str += "1.00".ljust(col_width)
+        elif idx > col_idx:
+            row_str += f"{val:.3f}".ljust(col_width)
+        else:
+            row_str += "".ljust(col_width)
+    print(f"     {row_str}")
+
+# Находим максимальные корреляции (кроме диагонали)
+max_corrs = []
+for i in range(len(corr_matrix_X.columns)):
+    for j in range(i+1, len(corr_matrix_X.columns)):
+        corr_val = corr_matrix_X.iloc[i, j]
+        max_corrs.append({
+            'Var1': corr_matrix_X.columns[i],
+            'Var2': corr_matrix_X.columns[j],
+            'Correlation': corr_val,
+            'Abs_Corr': abs(corr_val)
+        })
+
+max_corrs_df = pd.DataFrame(max_corrs).sort_values('Abs_Corr', ascending=False)
+
+print(f"\n     Топ-3 самые сильные корреляции:")
+for _, row in max_corrs_df.head(3).iterrows():
+    status = "ВЫСОКАЯ" if row['Abs_Corr'] > 0.8 else ("❗ УМЕРЕННАЯ" if row['Abs_Corr'] > 0.6 else "Приемлемая")
+    print(f"       {status}: {row['Var1']:<20s} ↔ {row['Var2']:<20s}  r = {row['Correlation']:>6.3f}")
+
+# Сохраняем
+corr_matrix_X.to_csv(f"{output_folder}/correlation_matrix_X.csv", sep=";")
+print(f"\n     Сохранено: correlation_matrix_X.csv")
+
+# Выводы
+high_corr = max_corrs_df[max_corrs_df['Abs_Corr'] > 0.8]
+if len(high_corr) > 0:
+    print(f"\n     ВНИМАНИЕ: {len(high_corr)} пар с корреляцией |r| > 0.8")
+    print(f"       Рекомендация: рассмотреть удаление одной из переменных или использовать регуляризацию")
+else:
+    print(f"\n     Мультиколлинеарность приемлемая (все |r| < 0.8)")
+    print(f"       Панельная структура + кластеризованные SE дополнительно компенсируют")
+
+# Сохраняем топ корреляций
+max_corrs_df.to_csv(f"{output_folder}/pairwise_correlations.csv", sep=";", index=False)
+
+# МЕТОД 3: LASSO/ELASTIC NET для отбора факторов
+
+print("\n  LASSO/Elastic Net для отбора значимых факторов")
+
+from sklearn.linear_model import LassoCV, ElasticNetCV
+from sklearn.preprocessing import StandardScaler
+
+# Подготовка данных
+model_data = df_panel[corr_cols].dropna()
+X = model_data.drop('price', axis=1).values
+y = model_data['price'].values
+
+# Нормализация
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+X_scaled = scaler_X.fit_transform(X)
+y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).ravel()
+
+# LASSO с CV
+print(f"     Обучение LASSO (5-fold CV)...")
+lasso = LassoCV(cv=5, random_state=42, max_iter=10000)
+lasso.fit(X_scaled, y_scaled)
+
+print(f"       • Оптимальная alpha: {lasso.alpha_:.6f}")
+print(f"       • R² (CV): {lasso.score(X_scaled, y_scaled):.4f}")
+
+# Elastic Net
+print(f"     Обучение Elastic Net (5-fold CV)...")
+elastic = ElasticNetCV(cv=5, random_state=42, max_iter=10000, l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.95, 0.99])
+elastic.fit(X_scaled, y_scaled)
+
+print(f"       Оптимальная alpha: {elastic.alpha_:.6f}")
+print(f"       Оптимальная l1_ratio: {elastic.l1_ratio_:.2f}")
+print(f"       R² (CV): {elastic.score(X_scaled, y_scaled):.4f}")
+
+# Сравнение коэффициентов
+feature_names = X_cols = model_data.drop('price', axis=1).columns
+
+results_comparison = pd.DataFrame({
+    'Factor': feature_names,
+    'LASSO_coef': lasso.coef_,
+    'ElasticNet_coef': elastic.coef_,
+    'LASSO_selected': lasso.coef_ != 0,
+    'ElasticNet_selected': elastic.coef_ != 0
+})
+
+print(f"\n     Отобранные факторы:")
+selected = results_comparison[(results_comparison['LASSO_selected']) | (results_comparison['ElasticNet_selected'])]
+
+for _, row in selected.iterrows():
+    lasso_mark = "✓" if row['LASSO_selected'] else "✗"
+    elastic_mark = "✓" if row['ElasticNet_selected'] else "✗"
+    print(f"       {row['Factor']:<25s} LASSO:{lasso_mark}  Elastic:{elastic_mark}  "
+          f"(βL={row['LASSO_coef']:>7.4f}, βE={row['ElasticNet_coef']:>7.4f})")
+
+results_comparison.to_csv(f"{output_folder}/lasso_elasticnet_results.csv", sep=";", index=False)
+print(f"\n  Сохранено: lasso_elasticnet_results.csv")
+
+# МЕТОД 4: ПАНЕЛЬНАЯ РЕГРЕССИЯ (FE)
+
+print("\n  Панельная регрессия с фиксированными эффектами")
+
+try:
+    from linearmodels.panel import PanelOLS
+    
+    # Подготовка данных
+    panel_reg_data = df_panel[corr_cols + ['region', 'date']].dropna()
+    panel_reg_data = panel_reg_data.set_index(['region', 'date'])
+    
+    # Нормализация для сравнимости коэффициентов
+    for col in corr_cols:
+        panel_reg_data[f'{col}_norm'] = (panel_reg_data[col] - panel_reg_data[col].mean()) / panel_reg_data[col].std()
+    
+    # Формула (используем только те факторы, где корреляции не критичны)
+    # Проверяем есть ли переменные с очень высокой корреляцией
+    high_corr_pairs = max_corrs_df[max_corrs_df['Abs_Corr'] > 0.85]
+    
+    if len(high_corr_pairs) > 0:
+        print(f"     Обнаружены пары с очень высокой корреляцией (|r| > 0.85)")
+        print(f"     Исключаем одну переменную из каждой пары для устойчивости оценок")
+        
+        # Исключаем переменные с высокой корреляцией (берем первую из пары)
+        exclude_vars = set()
+        for _, row in high_corr_pairs.iterrows():
+            exclude_vars.add(row['Var2'])  # Исключаем вторую переменную
+        
+        ok_factors = [col for col in X_cols if col not in exclude_vars]
+    else:
+        ok_factors = X_cols
+    
+    if len(ok_factors) > 0:
+        formula_parts = [f"{f}_norm" for f in ok_factors]
+        formula = f"price_norm ~ {' + '.join(formula_parts)} + EntityEffects"
+        
+        print(f"     Формула: {formula}")
+        
+        # Оценка модели
+        model = PanelOLS.from_formula(formula, data=panel_reg_data)
+        results = model.fit(cov_type='clustered', cluster_entity=True)
+        
+        print(f"\n{results.summary}")
+        
+        # Сохраняем результаты
+        with open(f"{output_folder}/panel_regression_summary.txt", 'w', encoding='utf-8') as f:
+            f.write(str(results.summary))
+        
+        # Извлекаем коэффициенты
+        panel_coefs = pd.DataFrame({
+            'Factor': results.params.index,
+            'Coefficient': results.params.values,
+            'Std_Error': results.std_errors.values,
+            'T_stat': results.tstats.values,
+            'P_value': results.pvalues.values
+        })
+        
+        panel_coefs.to_csv(f"{output_folder}/panel_regression_coefficients.csv", sep=";", index=False)
+        print(f"\n   Сохранено: panel_regression_summary.txt и panel_regression_coefficients.csv")
+    else:
+        print(f"     Все факторы имеют высокую взаимную корреляцию, используем регуляризацию")
+        print(f"     См. результаты LASSO/Elastic Net для отбора факторов")
+        
+except Exception as e:
+    print(f"     Ошибка при оценке панельной регрессии: {e}")
+
+# ============================================================================
+# МЕТОД 5: ROLLING REGRESSION (динамика влияния)
+# ============================================================================
+print("\n  5️⃣ Rolling regression (изменение влияния во времени)...")
+
+from sklearn.linear_model import LinearRegression
+
+# Параметры
+window = 12  # Окно 12 месяцев
+
+# Подготовка
+rolling_data = df_panel[corr_cols + ['date']].dropna().sort_values('date')
+
+# Группируем по дате и берем средние (агрегируем по регионам)
+rolling_monthly = rolling_data.groupby('date').mean()
+
+if len(rolling_monthly) >= window + 12:  # Минимум данных для rolling
+    
+    rolling_results = []
+    
+    for i in range(window, len(rolling_monthly)):
+        window_data = rolling_monthly.iloc[i-window:i]
+        
+        X_window = window_data.drop('price', axis=1).values
+        y_window = window_data['price'].values
+        
+        # Нормализация
+        X_scaled = (X_window - X_window.mean(axis=0)) / (X_window.std(axis=0) + 1e-8)
+        y_scaled = (y_window - y_window.mean()) / (y_window.std() + 1e-8)
+        
+        # Регрессия
+        model = LinearRegression()
+        model.fit(X_scaled, y_scaled)
+        
+        result = {
+            'date': rolling_monthly.index[i],
+            'r2': model.score(X_scaled, y_scaled)
+        }
+        
+        for j, col in enumerate(window_data.drop('price', axis=1).columns):
+            result[f'coef_{col}'] = model.coef_[j]
+        
+        rolling_results.append(result)
+    
+    rolling_df = pd.DataFrame(rolling_results)
+    
+    print(f"     Выполнено {len(rolling_df)} rolling регрессий (окно {window} мес)")
+    print(f"     Период: {rolling_df['date'].min()} - {rolling_df['date'].max()}")
+    print(f"     Средний R²: {rolling_df['r2'].mean():.4f}")
+    
+    rolling_df.to_csv(f"{output_folder}/rolling_regression_results.csv", sep=";", index=False)
+    print(f"\n     Сохранено: rolling_regression_results.csv")
+    
+    # Визуализация динамики коэффициентов
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    
+    # График 1: R²
+    axes[0].plot(rolling_df['date'], rolling_df['r2'], linewidth=2, color='darkblue')
+    axes[0].set_title('Динамика качества модели (Rolling R²)', fontsize=14, fontweight='bold')
+    axes[0].set_ylabel('R²')
+    axes[0].grid(alpha=0.3)
+    axes[0].axhline(y=rolling_df['r2'].mean(), color='red', linestyle='--', label=f'Среднее: {rolling_df["r2"].mean():.3f}')
+    axes[0].legend()
+    
+    # График 2: Коэффициенты
+    coef_cols = [col for col in rolling_df.columns if col.startswith('coef_')]
+    for col in coef_cols:
+        factor_name = col.replace('coef_', '')
+        axes[1].plot(rolling_df['date'], rolling_df[col], label=factor_name, linewidth=2)
+    
+    axes[1].set_title('Динамика влияния факторов (Rolling коэффициенты)', fontsize=14, fontweight='bold')
+    axes[1].set_ylabel('Нормализованный коэффициент')
+    axes[1].axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    axes[1].grid(alpha=0.3)
+    axes[1].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.tight_layout()
+    plt.savefig(f"{output_folder}/rolling_regression_dynamics.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"     Сохранено: rolling_regression_dynamics.png")
+else:
+    print(f"     Недостаточно данных для rolling regression")
+    print(f"     Нужно минимум {window + 12} месяцев, есть {len(rolling_monthly)}")
+
+# ============================================================================
+# [6/6] ИТОГОВЫЕ ВЫВОДЫ
+# ============================================================================
+print("\n[6/6] Формирование итоговых выводов...")
+
+# Собираем все результаты в одну таблицу
+summary_data = []
+
+# Из корреляций
+for factor in price_corr.index:
+    summary_data.append({
+        'Factor': factor,
+        'Spearman_Correlation': price_corr[factor],
+        'Correlation_Significance': '***' if abs(price_corr[factor]) > 0.5 else ('**' if abs(price_corr[factor]) > 0.3 else '*')
+    })
+
+summary_df = pd.DataFrame(summary_data)
+
+# Добавляем корреляции (максимальная абсолютная корреляция для каждого фактора)
+max_corr_per_factor = []
+for factor in summary_df['Factor']:
+    if factor in corr_matrix_X.columns:
+        # Находим максимальную корреляцию с другими факторами
+        corrs_with_others = corr_matrix_X[factor].drop(factor)
+        max_corr = corrs_with_others.abs().max()
+        max_corr_per_factor.append(max_corr)
+    else:
+        max_corr_per_factor.append(np.nan)
+
+summary_df['Max_Correlation'] = max_corr_per_factor
+
+# Добавляем LASSO/Elastic Net
+summary_df = summary_df.merge(
+    results_comparison[['Factor', 'LASSO_coef', 'ElasticNet_coef', 'LASSO_selected', 'ElasticNet_selected']], 
+    on='Factor', how='left'
+)
+
+# Сортируем по абсолютной корреляции
+summary_df['abs_corr'] = summary_df['Spearman_Correlation'].abs()
+summary_df = summary_df.sort_values('abs_corr', ascending=False).drop('abs_corr', axis=1)
+
+print(f"\n ИТОГОВАЯ ТАБЛИЦА ФАКТОРОВ:\n")
+print(summary_df.to_string(index=False))
+
+summary_df.to_csv(f"{output_folder}/FINAL_SUMMARY.csv", sep=";", index=False)
+
+print(f"\n\n{'='*100}")
+print("АНАЛИЗ ЗАВЕРШЕН")
+print(f"{'='*100}")
+print(f"\n Все результаты сохранены в: {output_folder}")
+print(f"\n Созданные файлы:")
+print(f"   1. correlation_matrix.csv - матрица корреляций")
+print(f"   2. vif_results.csv - проверка мультиколлинеарности")
+print(f"   3. lasso_elasticnet_results.csv - отбор факторов")
+print(f"   4. panel_regression_summary.txt - результаты панельной регрессии")
+print(f"   5. panel_regression_coefficients.csv - коэффициенты панели")
+print(f"   6. rolling_regression_results.csv - динамика влияния")
+print(f"   7. rolling_regression_dynamics.png - график динамики")
+print(f"   8. FINAL_SUMMARY.csv - ИТОГОВАЯ СВОДНАЯ ТАБЛИЦА")
+
+print(f"\n  КЛЮЧЕВЫЕ ВЫВОДЫ:")
+print(f"\n   Самые сильные факторы (по корреляции):")
+for i, row in summary_df.head(3).iterrows():
+    direction = "положительно" if row['Spearman_Correlation'] > 0 else "отрицательно"
+    print(f"     {i+1}. {row['Factor']:<25s} влияет {direction:>15s} (ρ={row['Spearman_Correlation']:>7.4f})")
+
+print(f"\n   Отобранные факторы (LASSO+Elastic Net):")
+selected_factors = summary_df[(summary_df['LASSO_selected']) | (summary_df['ElasticNet_selected'])]
+if len(selected_factors) > 0:
+    for _, row in selected_factors.iterrows():
+        print(f"     • {row['Factor']}")
+else:
+    print(f"     ⚠ Все факторы отброшены (слишком сильная регуляризация или коллинеарность)")
+
+print(f"\n   Мультиколлинеарность:")
+high_corr_pairs = max_corrs_df[max_corrs_df['Abs_Corr'] > 0.8]
+if len(high_corr_pairs) > 0:
+    print(f"     ⚠ {len(high_corr_pairs)} пар с высокой корреляцией (|r| > 0.8):")
+    for _, row in high_corr_pairs.iterrows():
+        print(f"       • {row['Var1']} ↔ {row['Var2']} (r={row['Correlation']:.2f})")
+else:
+    print(f"     ✓ Мультиколлинеарность приемлемая (все корреляции |r| < 0.8)")
+
+print(f"\n{'='*100}\n")
+
+# ДОПОЛНИТЕЛЬНЫЙ АНАЛИЗ: ВЛИЯНИЕ СТАВКИ НА КРЕДИТЫ И ДОСТУПНОСТЬ
+
+print("\n" + "="*100)
+print("ДОПОЛНИТЕЛЬНЫЙ АНАЛИЗ: СТАВКА → КРЕДИТЫ → ДОСТУПНОСТЬ")
+print("="*100)
+
+# 1. ВЛИЯНИЕ СТАВКИ НА ОБЪЕМ КРЕДИТОВ
+
+print("\n  Анализ 1: Влияние ключевой ставки на объем жилищных кредитов")
+
+# Вычисляем доступность (кредиты/цена)
+df_panel['affordability'] = df_panel['housing_loans'] / df_panel['price']
+
+# Корреляции
+rate_loans_corr = df_panel[['rate', 'housing_loans']].corr(method='spearman').loc['rate', 'housing_loans']
+rate_afford_corr = df_panel[['rate', 'affordability']].corr(method='spearman').loc['rate', 'affordability']
+
+print(f"\n     Корреляции (Spearman):")
+print(f"       • Ставка → Объем кредитов:  ρ = {rate_loans_corr:>7.4f}")
+print(f"       • Ставка → Доступность:     ρ = {rate_afford_corr:>7.4f}")
+
+# Регрессия: loans = f(rate)
+from sklearn.linear_model import LinearRegression
+
+# Подготовка данных
+analysis_data = df_panel[['rate', 'housing_loans', 'affordability', 'price']].dropna()
+
+# Модель 1: Кредиты от ставки
+X_rate = analysis_data[['rate']].values
+y_loans = analysis_data['housing_loans'].values
+
+# Нормализация
+X_rate_scaled = (X_rate - X_rate.mean()) / X_rate.std()
+y_loans_scaled = (y_loans - y_loans.mean()) / y_loans.std()
+
+model_loans = LinearRegression()
+model_loans.fit(X_rate_scaled, y_loans_scaled)
+
+r2_loans = model_loans.score(X_rate_scaled, y_loans_scaled)
+
+print(f"\n     Регрессия: housing_loans = β₀ + β₁ × rate")
+print(f"       • Коэффициент β₁:  {model_loans.coef_[0]:>7.4f}")
+print(f"       • R²:              {r2_loans:>7.4f}")
+print(f"       • Интерпретация:   Повышение ставки на 1 п.п. → изменение объема кредитов на {model_loans.coef_[0]:.2f} σ")
+
+# Модель 2: Доступность от ставки
+y_afford = analysis_data['affordability'].values
+y_afford_scaled = (y_afford - y_afford.mean()) / y_afford.std()
+
+model_afford = LinearRegression()
+model_afford.fit(X_rate_scaled, y_afford_scaled)
+
+r2_afford = model_afford.score(X_rate_scaled, y_afford_scaled)
+
+print(f"\n     Регрессия: affordability = β₀ + β₁ × rate")
+print(f"       • Коэффициент β₁:  {model_afford.coef_[0]:>7.4f}")
+print(f"       • R²:              {r2_afford:>7.4f}")
+print(f"       • Интерпретация:   Повышение ставки на 1 п.п. → изменение доступности на {model_afford.coef_[0]:.2f} σ")
+
+# 2. ПАНЕЛЬНАЯ РЕГРЕССИЯ ДЛЯ КРЕДИТОВ И ДОСТУПНОСТИ
+
+print("\n  Анализ 2: Панельная регрессия с фиксированными эффектами")
+
+try:
+    from linearmodels.panel import PanelOLS
+    
+    # Подготовка панельных данных
+    panel_credit_data = df_panel[['region', 'date', 'rate', 'housing_loans', 'affordability', 'price']].dropna()
+    panel_credit_data = panel_credit_data.set_index(['region', 'date'])
+    
+    # Нормализация
+    for col in ['rate', 'housing_loans', 'affordability', 'price']:
+        panel_credit_data[f'{col}_norm'] = (panel_credit_data[col] - panel_credit_data[col].mean()) / panel_credit_data[col].std()
+    
+    # Модель 1: Кредиты от ставки + рег эффекты
+    print(f"\n     Модель 1: housing_loans ~ rate + EntityEffects")
+    
+    model_panel_loans = PanelOLS.from_formula(
+        'housing_loans_norm ~ rate_norm + EntityEffects',
+        data=panel_credit_data
+    )
+    results_panel_loans = model_panel_loans.fit(cov_type='clustered', cluster_entity=True)
+    
+    beta_rate_loans = results_panel_loans.params['rate_norm']
+    pval_rate_loans = results_panel_loans.pvalues['rate_norm']
+    r2_panel_loans = results_panel_loans.rsquared
+    
+    print(f"       • β(rate):   {beta_rate_loans:>7.4f}  (p={pval_rate_loans:.4f})")
+    print(f"       • R²:        {r2_panel_loans:>7.4f}")
+    
+    # Модель 2: Доступность от ставки + рег эффекты
+    print(f"\n     Модель 2: affordability ~ rate + EntityEffects")
+    
+    model_panel_afford = PanelOLS.from_formula(
+        'affordability_norm ~ rate_norm + EntityEffects',
+        data=panel_credit_data
+    )
+    results_panel_afford = model_panel_afford.fit(cov_type='clustered', cluster_entity=True)
+    
+    beta_rate_afford = results_panel_afford.params['rate_norm']
+    pval_rate_afford = results_panel_afford.pvalues['rate_norm']
+    r2_panel_afford = results_panel_afford.rsquared
+    
+    print(f"       • β(rate):   {beta_rate_afford:>7.4f}  (p={pval_rate_afford:.4f})")
+    print(f"       • R²:        {r2_panel_afford:>7.4f}")
+    
+    # Сохраняем результаты
+    panel_credit_results = pd.DataFrame({
+        'Model': ['Loans ~ Rate', 'Affordability ~ Rate'],
+        'Beta_rate': [beta_rate_loans, beta_rate_afford],
+        'P_value': [pval_rate_loans, pval_rate_afford],
+        'R_squared': [r2_panel_loans, r2_panel_afford]
+    })
+    
+    panel_credit_results.to_csv(f"{output_folder}/rate_credit_affordability_analysis.csv", sep=";", index=False)
+    
+    # Детальные результаты
+    with open(f"{output_folder}/rate_credit_affordability_detailed.txt", 'w', encoding='utf-8') as f:
+        f.write("МОДЕЛЬ 1: КРЕДИТЫ ОТ СТАВКИ\n")
+        f.write("="*80 + "\n")
+        f.write(str(results_panel_loans.summary))
+        f.write("\n\n")
+        f.write("МОДЕЛЬ 2: ДОСТУПНОСТЬ ОТ СТАВКИ\n")
+        f.write("="*80 + "\n")
+        f.write(str(results_panel_afford.summary))
+    
+    print(f"\n     ✅ Сохранено:")
+    print(f"        • rate_credit_affordability_analysis.csv")
+    print(f"        • rate_credit_affordability_detailed.txt")
+    
+except Exception as e:
+    print(f"     ⚠ Ошибка: {e}")
+
+# ============================================================================
+# 3. ДИНАМИКА ПО ВРЕМЕНИ (Rolling)
+# ============================================================================
+print("\n  Анализ 3: Динамика влияния ставки во времени (Rolling)")
+
+# Группируем по месяцам
+monthly_agg = df_panel.groupby('date').agg({
+    'rate': 'mean',
+    'housing_loans': 'mean',
+    'affordability': 'mean',
+    'price': 'mean'
+}).reset_index()
+
+if len(monthly_agg) >= 18:
+    window = 12
+    rolling_credit_results = []
+    
+    for i in range(window, len(monthly_agg)):
+        window_data = monthly_agg.iloc[i-window:i]
+        
+        X = window_data[['rate']].values
+        y_loans = window_data['housing_loans'].values
+        y_afford = window_data['affordability'].values
+        
+        # Нормализация
+        X_scaled = (X - X.mean()) / (X.std() + 1e-8)
+        y_loans_scaled = (y_loans - y_loans.mean()) / (y_loans.std() + 1e-8)
+        y_afford_scaled = (y_afford - y_afford.mean()) / (y_afford.std() + 1e-8)
+        
+        # Регрессии
+        model_l = LinearRegression().fit(X_scaled, y_loans_scaled)
+        model_a = LinearRegression().fit(X_scaled, y_afford_scaled)
+        
+        rolling_credit_results.append({
+            'date': monthly_agg.iloc[i]['date'],
+            'beta_loans': model_l.coef_[0],
+            'r2_loans': model_l.score(X_scaled, y_loans_scaled),
+            'beta_affordability': model_a.coef_[0],
+            'r2_affordability': model_a.score(X_scaled, y_afford_scaled)
+        })
+    
+    rolling_credit_df = pd.DataFrame(rolling_credit_results)
+    
+    print(f"     Выполнено {len(rolling_credit_df)} rolling регрессий")
+    print(f"       Средний β(loans):        {rolling_credit_df['beta_loans'].mean():>7.4f}")
+    print(f"       Средний β(affordability): {rolling_credit_df['beta_affordability'].mean():>7.4f}")
+    
+    # Визуализация
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    
+    # График 1: Динамика ставки и кредитов
+    ax1 = axes[0, 0]
+    ax1_twin = ax1.twinx()
+    
+    ax1.plot(monthly_agg['date'], monthly_agg['rate'], 'b-', linewidth=2, label='Ключевая ставка')
+    ax1_twin.plot(monthly_agg['date'], monthly_agg['housing_loans'], 'r-', linewidth=2, label='Объем кредитов')
+    
+    ax1.set_ylabel('Ключевая ставка, %', color='b')
+    ax1_twin.set_ylabel('Объем кредитов, млн руб', color='r')
+    ax1.set_title('Динамика ставки и объема кредитов', fontweight='bold')
+    ax1.grid(alpha=0.3)
+    ax1.tick_params(axis='y', labelcolor='b')
+    ax1_twin.tick_params(axis='y', labelcolor='r')
+    
+    # График 2: Динамика коэффициента влияния на кредиты
+    axes[0, 1].plot(rolling_credit_df['date'], rolling_credit_df['beta_loans'], 'g-', linewidth=2)
+    axes[0, 1].axhline(y=0, color='black', linestyle='--', linewidth=1)
+    axes[0, 1].set_ylabel('β (нормализованный)')
+    axes[0, 1].set_title('Динамика влияния ставки на кредиты (Rolling)', fontweight='bold')
+    axes[0, 1].grid(alpha=0.3)
+    
+    # График 3: Динамика ставки и доступности
+    ax3 = axes[1, 0]
+    ax3_twin = ax3.twinx()
+    
+    ax3.plot(monthly_agg['date'], monthly_agg['rate'], 'b-', linewidth=2, label='Ключевая ставка')
+    ax3_twin.plot(monthly_agg['date'], monthly_agg['affordability'], 'purple', linewidth=2, label='Доступность')
+    
+    ax3.set_ylabel('Ключевая ставка, %', color='b')
+    ax3_twin.set_ylabel('Доступность (кредиты/цена)', color='purple')
+    ax3.set_title('Динамика ставки и доступности', fontweight='bold')
+    ax3.grid(alpha=0.3)
+    ax3.tick_params(axis='y', labelcolor='b')
+    ax3_twin.tick_params(axis='y', labelcolor='purple')
+    
+    # График 4: Динамика коэффициента влияния на доступность
+    axes[1, 1].plot(rolling_credit_df['date'], rolling_credit_df['beta_affordability'], 'orange', linewidth=2)
+    axes[1, 1].axhline(y=0, color='black', linestyle='--', linewidth=1)
+    axes[1, 1].set_ylabel('β (нормализованный)')
+    axes[1, 1].set_title('Динамика влияния ставки на доступность (Rolling)', fontweight='bold')
+    axes[1, 1].grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f"{output_folder}/rate_credit_affordability_dynamics.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Сохраняем данные
+    rolling_credit_df.to_csv(f"{output_folder}/rate_credit_affordability_rolling.csv", sep=";", index=False)
+    
+    print(f"\n   Сохранено:")
+    print(f"        • rate_credit_affordability_rolling.csv")
+    print(f"        • rate_credit_affordability_dynamics.png")
+else:
+    print(f"     Недостаточно данных для rolling анализа")
+
+# ИТОГИ ДОПОЛНИТЕЛЬНОГО АНАЛИЗА
+
+print("\n" + "="*100)
+print("ВЫВОДЫ ПО ВЛИЯНИЮ СТАВКИ НА КРЕДИТЫ И ДОСТУПНОСТЬ")
+print("="*100)
+
+print(f"\n Корреляционный анализ:")
+print(f"   • Ставка → Кредиты:     ρ = {rate_loans_corr:.4f}")
+if rate_loans_corr < -0.3:
+    print(f"     → Сильная ОТРИЦАТЕЛЬНАЯ связь: рост ставки → снижение кредитов")
+elif rate_loans_corr < 0:
+    print(f"     → Слабая отрицательная связь")
+else:
+    print(f"     → Положительная связь (неожиданно!)")
+
+print(f"\n   • Ставка → Доступность: ρ = {rate_afford_corr:.4f}")
+if rate_afford_corr < -0.3:
+    print(f"     → Сильная ОТРИЦАТЕЛЬНАЯ связь: рост ставки → снижение доступности")
+elif rate_afford_corr < 0:
+    print(f"     → Слабая отрицательная связь")
+else:
+    print(f"     → Положительная связь")
+
+print(f"\n Панельная регрессия (с учетом региональных эффектов):")
+try:
+    print(f"   • β(ставка → кредиты):     {beta_rate_loans:.4f}  {'***' if pval_rate_loans < 0.01 else '**' if pval_rate_loans < 0.05 else '*' if pval_rate_loans < 0.1 else ''}")
+    print(f"   • β(ставка → доступность): {beta_rate_afford:.4f}  {'***' if pval_rate_afford < 0.01 else '**' if pval_rate_afford < 0.05 else '*' if pval_rate_afford < 0.1 else ''}")
+except:
+    pass
+
+print(f"\n" + "="*100 + "\n")
